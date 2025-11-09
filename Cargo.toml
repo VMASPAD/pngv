@@ -1,0 +1,23 @@
+[package]
+name = "pngv"
+version = "0.1.0"
+edition = "2021"
+authors = ["VMASPAD"]
+description = "A library and CLI tool for converting PNG images to color matrices and reconstructing them as PNG or SVG"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/vmaspad/pngv"
+keywords = ["png", "svg", "image", "converter", "matrix"]
+categories = ["multimedia::images", "command-line-utilities"]
+readme = "README.md"
+
+[[bin]]
+name = "pngv"
+path = "src/main.rs"
+
+[lib]
+name = "pngv"
+path = "src/lib.rs"
+
+[dependencies]
+image = "0.24"
+serde_json = "1.0"
