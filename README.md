@@ -113,6 +113,12 @@ The `.pngv` file is a JSON array of arrays, where each element represents a pixe
 - Each color is in `#RRGGBBAA` format (Red, Green, Blue, Alpha in hexadecimal)
 - Alpha channel is fully supported
 
+# Example
+
+![example](./example.png)
+
+
+
 ## Use Cases
 
 - **Pixel art editing**: Edit images as JSON matrices
@@ -120,6 +126,7 @@ The `.pngv` file is a JSON array of arrays, where each element represents a pixe
 - **Vector conversion**: Convert pixel art to scalable SVG format
 - **Data visualization**: Represent images as color data
 - **Backup/versioning**: Store images in text-friendly format
+
 
 ## License
 
