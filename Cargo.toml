@@ -19,5 +19,12 @@ name = "pngv"
 path = "src/lib.rs"
 
 [dependencies]
+geo = "0.21"
+geo-booleanop = "0.3"
 image = "0.24"
+indexmap = "2.13.0"
+indicatif = "0.18.4"
+rayon = "1.11.0"
+roxmltree = "0.21.1"
 serde_json = "1.0"
+svg = "0.18.0"
