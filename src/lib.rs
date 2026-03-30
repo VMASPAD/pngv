@@ -29,6 +29,14 @@ use std::fs;
 use image::io::Reader as ImageReader;
 use image::{RgbaImage, Rgba};
 use std::path::Path;
+use geo::{coord, MultiPolygon, Polygon, Rect, BooleanOps};
+use indexmap::IndexMap;
+use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
+use roxmltree::Document;
+use svg::node::element::path::Data;
+use svg::node::element::Path as SvgPath;
+use svg::Document as SvgDocument;
 
 /// Encodes a PNG image to a `.pngv` color matrix file
 ///
@@ -198,4 +206,98 @@ fn parse_hex_color(hex: &str) -> Result<Rgba<u8>, Box<dyn Error>> {
     let a = u8::from_str_radix(&hex[6..8], 16)?;
     
     Ok(Rgba([r, g, b, a]))
+}
+
+/// Perform boolean union on SVG <rect> elements grouped by fill color and
+/// write an optimized SVG with combined paths.
+pub fn union_boolean(input: &str, output: &str) -> Result<(), Box<dyn Error>> {
+    // Configure Rayon thread pool (may only be set once per process)
+    let _ = rayon::ThreadPoolBuilder::new().num_threads(12).build_global();
+
+    // Read and parse SVG
+    let input_svg = fs::read_to_string(input)?;
+    let doc = Document::parse(&input_svg)?;
+
+    // Group rects by fill attribute while preserving insertion order
+    let mut color_groups: IndexMap<String, Vec<Polygon<f64>>> = IndexMap::new();
+
+    for node in doc.descendants().filter(|n| n.has_tag_name("rect")) {
+        let x: f64 = node.attribute("x").unwrap_or("0").parse().unwrap_or(0.0);
+        let y: f64 = node.attribute("y").unwrap_or("0").parse().unwrap_or(0.0);
+        let w: f64 = node.attribute("width").unwrap_or("1").parse().unwrap_or(1.0);
+        let h: f64 = node.attribute("height").unwrap_or("1").parse().unwrap_or(1.0);
+        let fill = node.attribute("fill").unwrap_or("#000000").to_string();
+
+        let rect = Rect::new(coord! { x: x, y: y }, coord! { x: x + w, y: y + h });
+        color_groups.entry(fill).or_default().push(rect.into());
+    }
+
+    // Progress bar
+    let total_polygons: usize = color_groups.values().map(|v| v.len()).sum();
+    let pb = ProgressBar::new(total_polygons as u64);
+    pb.set_style(
+        ProgressStyle::with_template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} rectángulos ETA: {eta}")
+            .unwrap()
+            .progress_chars("##-"),
+    );
+
+    let mut output_document = SvgDocument::new();
+
+    for (color, polygons) in color_groups {
+        if polygons.is_empty() {
+            continue;
+        }
+
+        let pb_clone = pb.clone();
+        let count = polygons.len() as u64;
+
+        // Parallel reduction: each polygon -> MultiPolygon, then union them
+        let unified_shape: MultiPolygon<f64> = polygons
+            .into_par_iter()
+            .map(|poly| MultiPolygon(vec![poly]))
+            .reduce(
+                || MultiPolygon(vec![]),
+                |a: MultiPolygon<f64>, b: MultiPolygon<f64>| a.union(&b),
+            );
+
+        pb_clone.inc(count);
+
+        // Build SVG path data including interiors (holes)
+        let mut path_data = Data::new();
+        for poly in unified_shape.into_iter() {
+            let ext = poly.exterior();
+            let mut points = ext.points();
+            if let Some(first) = points.next() {
+                path_data = path_data.move_to((first.x(), first.y()));
+                for p in points {
+                    path_data = path_data.line_to((p.x(), p.y()));
+                }
+                path_data = path_data.close();
+            }
+
+            for interior in poly.interiors() {
+                let mut points = interior.points();
+                if let Some(first) = points.next() {
+                    path_data = path_data.move_to((first.x(), first.y()));
+                    for p in points {
+                        path_data = path_data.line_to((p.x(), p.y()));
+                    }
+                    path_data = path_data.close();
+                }
+            }
+        }
+
+        let path = SvgPath::new()
+            .set("fill", color)
+            .set("fill-rule", "evenodd")
+            .set("d", path_data);
+
+        output_document = output_document.add(path);
+    }
+
+    pb.finish_with_message("¡Procesamiento completado!");
+
+    svg::save(output, &output_document)?;
+
+    Ok(())
 }
