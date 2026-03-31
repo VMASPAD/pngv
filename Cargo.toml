@@ -1,6 +1,6 @@
 [package]
 name = "pngv"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["VMASPAD"]
 description = "A library and CLI tool for converting PNG images to color matrices and reconstructing them as PNG or SVG"

@@ -79,6 +79,18 @@ pngv svg input.pngv output.svg
 # Creates: output.svg
 ```
 
+#### Compress: SVG → SVG (optimized)
+
+Optimize an SVG created from many `<rect>` elements by merging adjacent or overlapping rectangles of the same fill color into combined paths using boolean union. This can significantly reduce file size and simplify SVGs produced from pixel-art or tiled rectangles.
+
+```bash
+pngv compress image.svg
+# Creates: output.svg
+
+pngv compress input.svg output.svg
+# Creates: output.svg
+```
+
 ## Library Usage
 
 ```rust
