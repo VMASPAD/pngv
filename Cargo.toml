@@ -19,10 +19,9 @@ name = "pngv"
 path = "src/lib.rs"
 
 [dependencies]
-geo = "0.21"
-geo-booleanop = "0.3"
+geo = "0.32"
 image = "0.24"
-indexmap = "2.13.0"
+indexmap = { version = "2.13.0", features = ["rayon"] }
 indicatif = "0.18.4"
 rayon = "1.11.0"
 roxmltree = "0.21.1"

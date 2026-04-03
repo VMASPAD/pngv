@@ -29,7 +29,8 @@ use std::fs;
 use image::io::Reader as ImageReader;
 use image::{RgbaImage, Rgba};
 use std::path::Path;
-use geo::{coord, MultiPolygon, Polygon, Rect, BooleanOps};
+use geo::{Coord, MultiPolygon, Polygon, LineString};
+use geo::algorithm::bool_ops::unary_union;
 use indexmap::IndexMap;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
@@ -37,6 +38,8 @@ use roxmltree::Document;
 use svg::node::element::path::Data;
 use svg::node::element::Path as SvgPath;
 use svg::Document as SvgDocument;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Encodes a PNG image to a `.pngv` color matrix file
 ///
@@ -208,15 +211,54 @@ fn parse_hex_color(hex: &str) -> Result<Rgba<u8>, Box<dyn Error>> {
     Ok(Rgba([r, g, b, a]))
 }
 
-/// Perform boolean union on SVG <rect> elements grouped by fill color and
-/// write an optimized SVG with combined paths.
-pub fn union_boolean(input: &str, output: &str) -> Result<(), Box<dyn Error>> {
-    // Configure Rayon thread pool (may only be set once per process)
-    let _ = rayon::ThreadPoolBuilder::new().num_threads(12).build_global();
+/// Creates a rectangle `Polygon<f64>` from position and size.
+fn make_rect_polygon(x: f64, y: f64, w: f64, h: f64) -> Polygon<f64> {
+    Polygon::new(
+        LineString::from(vec![
+            Coord { x, y },
+            Coord { x: x + w, y },
+            Coord { x: x + w, y: y + h },
+            Coord { x, y: y + h },
+            Coord { x, y },
+        ]),
+        vec![],
+    )
+}
 
+/// Perform boolean union on SVG `<rect>` elements grouped by fill color and
+/// write an optimized SVG with combined paths.
+///
+/// # Algorithm
+///
+/// 1. **Parse** the input SVG and extract all `<rect>` elements
+/// 2. **Group** rectangles by fill color using an `IndexMap` for stable ordering
+/// 3. **Parallel color processing**: each Rayon thread handles one color group
+///    entirely — one core per color for maximum throughput
+/// 4. **`unary_union`** (geo 0.32 + iOverlay engine) merges all polygons of a
+///    single color in one optimized sweep-line pass (O(n log n) vs O(n²))
+/// 5. **Generate** a unified vectorial SVG with one `<path>` per color
+pub fn union_boolean(input: &str, output: &str) -> Result<(), Box<dyn Error>> {
     // Read and parse SVG
     let input_svg = fs::read_to_string(input)?;
     let doc = Document::parse(&input_svg)?;
+
+    // Extract viewBox / dimensions from the root <svg> element
+    let svg_root = doc
+        .descendants()
+        .find(|n| n.has_tag_name("svg"))
+        .ok_or("No <svg> root element found")?;
+
+    let svg_width: f64 = svg_root
+        .attribute("width")
+        .unwrap_or("0")
+        .parse()
+        .unwrap_or(0.0);
+    let svg_height: f64 = svg_root
+        .attribute("height")
+        .unwrap_or("0")
+        .parse()
+        .unwrap_or(0.0);
+    let view_box = svg_root.attribute("viewBox").map(|s| s.to_string());
 
     // Group rects by fill attribute while preserving insertion order
     let mut color_groups: IndexMap<String, Vec<Polygon<f64>>> = IndexMap::new();
@@ -228,43 +270,76 @@ pub fn union_boolean(input: &str, output: &str) -> Result<(), Box<dyn Error>> {
         let h: f64 = node.attribute("height").unwrap_or("1").parse().unwrap_or(1.0);
         let fill = node.attribute("fill").unwrap_or("#000000").to_string();
 
-        let rect = Rect::new(coord! { x: x, y: y }, coord! { x: x + w, y: y + h });
-        color_groups.entry(fill).or_default().push(rect.into());
+        color_groups
+            .entry(fill)
+            .or_default()
+            .push(make_rect_polygon(x, y, w, h));
     }
 
-    // Progress bar
-    let total_polygons: usize = color_groups.values().map(|v| v.len()).sum();
-    let pb = ProgressBar::new(total_polygons as u64);
+    let total_colors = color_groups.len();
+
+    // Progress bar — tracks colors processed (each color is one parallel unit)
+    let pb = ProgressBar::new(total_colors as u64);
     pb.set_style(
-        ProgressStyle::with_template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} rectángulos ETA: {eta}")
-            .unwrap()
-            .progress_chars("##-"),
+        ProgressStyle::with_template(
+            "[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} colores (núcleos) ETA: {eta}",
+        )
+        .unwrap()
+        .progress_chars("██░"),
     );
 
+    // Atomic counter shared across threads for progress
+    let progress_counter = Arc::new(AtomicU64::new(0));
+
+    // ─── Parallel processing: one core per color ───────────────────────
+    // Each color group is processed independently by a Rayon thread.
+    // Inside each thread, `unary_union` performs the merge using the
+    // iOverlay sweep-line algorithm — far faster than iterative binary union.
+    let results: Vec<(String, MultiPolygon<f64>)> = color_groups
+        .into_par_iter()
+        .map(|(color, polygons)| {
+            let unified = if polygons.len() == 1 {
+                // Single polygon — no union needed
+                MultiPolygon::new(polygons)
+            } else {
+                // unary_union: O(n log n) sweep-line merge via iOverlay
+                unary_union(&polygons)
+            };
+
+            // Update progress
+            let done = progress_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            pb.set_position(done);
+
+            (color, unified)
+        })
+        .collect();
+
+    pb.finish_with_message("¡Procesamiento completado!");
+
+    // ─── Build output SVG ──────────────────────────────────────────────
     let mut output_document = SvgDocument::new();
 
-    for (color, polygons) in color_groups {
-        if polygons.is_empty() {
-            continue;
-        }
+    // Set dimensions and viewBox
+    if svg_width > 0.0 && svg_height > 0.0 {
+        output_document = output_document
+            .set("width", svg_width)
+            .set("height", svg_height);
+    }
+    if let Some(vb) = view_box {
+        output_document = output_document.set("viewBox", vb);
+    } else if svg_width > 0.0 && svg_height > 0.0 {
+        output_document = output_document.set(
+            "viewBox",
+            format!("0 0 {} {}", svg_width, svg_height),
+        );
+    }
 
-        let pb_clone = pb.clone();
-        let count = polygons.len() as u64;
-
-        // Parallel reduction: each polygon -> MultiPolygon, then union them
-        let unified_shape: MultiPolygon<f64> = polygons
-            .into_par_iter()
-            .map(|poly| MultiPolygon(vec![poly]))
-            .reduce(
-                || MultiPolygon(vec![]),
-                |a: MultiPolygon<f64>, b: MultiPolygon<f64>| a.union(&b),
-            );
-
-        pb_clone.inc(count);
-
-        // Build SVG path data including interiors (holes)
+    // Generate one <path> per color — each is a single unified vector shape
+    for (color, multi_poly) in results {
         let mut path_data = Data::new();
-        for poly in unified_shape.into_iter() {
+
+        for poly in multi_poly.iter() {
+            // Exterior ring
             let ext = poly.exterior();
             let mut points = ext.points();
             if let Some(first) = points.next() {
@@ -275,6 +350,7 @@ pub fn union_boolean(input: &str, output: &str) -> Result<(), Box<dyn Error>> {
                 path_data = path_data.close();
             }
 
+            // Interior rings (holes)
             for interior in poly.interiors() {
                 let mut points = interior.points();
                 if let Some(first) = points.next() {
@@ -295,9 +371,8 @@ pub fn union_boolean(input: &str, output: &str) -> Result<(), Box<dyn Error>> {
         output_document = output_document.add(path);
     }
 
-    pb.finish_with_message("¡Procesamiento completado!");
-
     svg::save(output, &output_document)?;
 
     Ok(())
 }
+
